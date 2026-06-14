@@ -79,11 +79,7 @@ impl SdMmc {
     ///
     /// The caller must ensure that `base` is a valid pointer to the SD/MMC controller's
     /// register block and that no other code is concurrently accessing the same hardware.
-    pub unsafe fn new(
-        base: usize,
-        ahb_data_width: AHBDataWidth,
-        register_irq: impl FnOnce() -> bool,
-    ) -> Self {
+    pub unsafe fn new(base: usize, register_irq: impl FnOnce() -> bool) -> Self {
         SDMMC_BASE_ADDR.store(base, Ordering::Release);
         let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(base as *mut _)) };
 
@@ -91,10 +87,10 @@ impl SdMmc {
             regs,
             num_blocks: 0,
             dma_buffer: None,
-            ahb_data_width,
+            ahb_data_width: AHBDataWidth::Bits32,
         };
         this.init();
-        let _ = this.try_enable_idmac(register_irq);
+        this.try_enable_idmac(512, AHBDataWidth::Bits32, register_irq);
         this
     }
 
@@ -124,6 +120,7 @@ impl SdMmc {
         let idsts = self.regs.idsts().read();
         self.regs.idsts().write(idsts);
     }
+
     /// 发送 SD/MMC 命令，并等待其响应和数据传输（如果是 PIO 模式）。
     pub fn send_cmd(&self, command: Command<'_>) -> Option<[u32; 4]> {
         trace!("send_cmd {command:#x?}");
@@ -429,142 +426,199 @@ impl SdMmc {
         info!("SD/MMC driver initialized");
     }
     /// 尝试为 SD/MMC 控制器启用内置 DMA 控制器 (IDMAC)。
-    ///
-    /// 该函数会执行以下步骤：
-    /// 1. 分配对齐的物理连续 DMA 缓冲区。
-    /// 2. 清除原始中断状态和 DMA 状态寄存器。
-    /// 3. 配置总线模式（BMOD）和控制（CTRL）寄存器启用 DMA 模式，并进行写后读校验。
-    /// 4. 在 IDINTEN 和 INTMASK 中使能 DMA 相关中断，并进行写后读校验。
-    /// 5. 执行 `register_irq` 闭包注册硬件中断。
-    /// 6. 如果中途任何一步失败，将自动释放内存并恢复至 PIO 模式以安全降级（包括对 BMOD 和 CTRL 的软硬件复位）。
-    /// 如果成功启用则返回 `Ok(())`，否则返回包含错误信息的 `Err(&'static str)`。
-    pub fn try_enable_idmac<F>(&mut self, register_irq: F) -> Result<(), &'static str>
-    where
-        F: FnOnce() -> bool,
-    {
-        // 1. 分配对齐的物理连续 DMA 缓冲区 (DMABuffer)
-        let layout = core::alloc::Layout::from_size_align(
-            Self::BLOCK_SIZE,
-            self.ahb_data_width.align_value(),
-        )
-        .expect("Invalid layout for DMA buffer");
-
-        let dma_info = match unsafe { crate::dma::alloc_coherent(layout) } {
+    pub fn try_enable_idmac(
+        &mut self,
+        buf_size: usize,
+        ahb_data_width: AHBDataWidth,
+        register_irq: impl FnOnce() -> bool,
+    ) {
+        // Step 1: Allocate a DMA buffer for the data transfer.
+        // According to DW_MSHC specification, data in the buffer must be 4 bytes aligned in 32 modes
+        let layout = core::alloc::Layout::from_size_align(buf_size, ahb_data_width.align_value())
+            .expect("Invalid layout for DMA buffer");
+        match unsafe { crate::dma::alloc_coherent(layout) } {
             Ok(dma_info) => {
-                info!(
-                    "DMA buffer allocated: virt=0x{:08x}, phys=0x{:08x}, size={}",
-                    dma_info.cpu_addr.as_ptr() as usize,
-                    dma_info.bus_addr.as_u64(),
-                    Self::BLOCK_SIZE
-                );
-                dma_info
+                self.dma_buffer = Some(DMABuffer {
+                    addr: dma_info,
+                    size: buf_size,
+                });
             }
             Err(e) => {
                 warn!(
                     "Failed to allocate DMA buffer: {:?}, use PIO mode instead",
                     e
                 );
-                return Err("Failed to allocate coherent DMA memory");
-            }
-        };
-
-        // 后续配置逻辑，如果执行失败，会在 Err 分支中执行清理回退
-        let configure_and_register = || {
-            // 2. 清除残留状态 (RINTSTS & IDSTS)
-            let rintsts = self.regs.rintsts().read();
-            self.regs.rintsts().write(rintsts);
-
-            let idsts = self.regs.idsts().read();
-            self.regs.idsts().write(idsts);
-
-            // 3. 配置 BMOD（总线模式）寄存器：de = true, fb = true
-            self.regs.bmod().update(|r| r.with_de(true).with_fb(true));
-            // 硬件校验: Read-after-Write
-            let bmod_val = self.regs.bmod().read();
-            if !bmod_val.de() || !bmod_val.fb() {
-                return Err("Hardware verification failed: BMOD de/fb not set");
-            }
-
-            // 4. 配置 CTRL（控制）寄存器：use_internal_dmac = true, int_enable = true
-            self.regs
-                .ctrl()
-                .update(|r| r.with_use_internal_dmac(true).with_int_enable(true));
-            // 硬件校验: Read-after-Write
-            let ctrl_val = self.regs.ctrl().read();
-            if !ctrl_val.use_internal_dmac() || !ctrl_val.int_enable() {
-                return Err(
-                    "Hardware verification failed: CTRL use_internal_dmac/int_enable not set",
-                );
-            }
-
-            // 5. 使能 DMA 相关中断
-            use crate::regs::IdIntEn;
-            let idinten = IdIntEn::new()
-                .with_ni(true) // 正常中断汇总使能
-                .with_ai(true) // 异常中断汇总使能
-                .with_ti(true) // 发送完成中断使能
-                .with_ri(true) // 接收完成中断使能
-                .with_fbe(true) // 致命总线错误使能
-                .with_du(true) // 描述符不可用使能
-                .with_ces(true); // 卡错误汇总使能
-            self.regs.idinten().write(idinten);
-            // 硬件校验: Read-after-Write
-            let idinten_val = self.regs.idinten().read();
-            if !idinten_val.ni()
-                || !idinten_val.ai()
-                || !idinten_val.ti()
-                || !idinten_val.ri()
-                || !idinten_val.fbe()
-                || !idinten_val.du()
-                || !idinten_val.ces()
-            {
-                return Err("Hardware verification failed: IDINTEN flags not matching");
-            }
-
-            // 在 INTMASK 中允许数据传输结束 (dto) 中断
-            self.regs.intmask().update(|r| r.with_dto(true));
-            // 硬件校验: Read-after-Write
-            let intmask_val = self.regs.intmask().read();
-            if !intmask_val.dto() {
-                return Err("Hardware verification failed: INTMASK dto not set");
-            }
-
-            // 6. 注册硬件中断处理函数 (IRQ)
-            if !register_irq() {
-                return Err("Failed to register IRQ");
-            }
-
-            Ok(())
-        };
-
-        match configure_and_register() {
-            Ok(()) => {
-                self.dma_buffer = Some(DMABuffer {
-                    addr: dma_info,
-                    size: Self::BLOCK_SIZE,
-                });
-                Ok(())
-            }
-            Err(err) => {
-                // 7. 回退与清理机制：释放内存并恢复/复位寄存器状态
-                unsafe {
-                    crate::dma::dealloc_coherent(dma_info, layout);
-                }
-
-                // 强化硬件复位，防止硬件卡死
-                self.regs.bmod().update(|r| r.with_de(false).with_swr(true));
-                wait_until(|| !self.regs.bmod().read().swr());
-
-                self.regs
-                    .ctrl()
-                    .update(|r| r.with_use_internal_dmac(false).with_dma_reset(true));
-                wait_until(|| !self.regs.ctrl().read().dma_reset());
-
-                self.regs.idinten().write(0.into());
-                self.dma_buffer = None;
-                Err(err)
+                return;
             }
         }
+
+        // Step 2: Set up the IDMAC descriptor ring and point the DBADDR register to it.
+
+        // Step 3: Configure the BMOD and CTRL registers to enable IDMAC.
+        // If failed, deallocate the DMA buffer and return without enabling IDMAC.
+
+        let rintsts_before_enable = self.regs.rintsts().read();
+        let idsts_before_enable = self.regs.idsts().read();
+        if rintsts_before_enable.error()
+            || rintsts_before_enable.data_transfer_over()
+            || rintsts_before_enable.receive_fifo_data_request()
+            || rintsts_before_enable.transmit_fifo_data_request()
+        {
+            self.regs.rintsts().write(rintsts_before_enable);
+        }
+        if idsts_before_enable.ais()
+            || idsts_before_enable.nis()
+            || idsts_before_enable.ces()
+            || idsts_before_enable.du()
+            || idsts_before_enable.fbe()
+            || idsts_before_enable.ri()
+            || idsts_before_enable.ti()
+        {
+            self.clear_idmac_interrupts();
+        }
+
+        // Set the BMOD register to enable the internal DMA controller (IDMAC).
+        // BMOD's PBL value is read-only value and is the mirror of MSIZE of FIFOTH register.
+        // And the DSL value is applicable only for dual buffer structure.
+        self.regs
+            .bmod()
+            .update(|r| r.with_de(true).with_dsl(0).with_fb(true));
+        // Immediately reading back BMOD register after writing is necessary to ensure that the write has taken effect before proceeding.
+        let bmod_after = self.regs.bmod().read();
+        let idsts_after_bmod = self.regs.idsts().read();
+        if idsts_after_bmod.du() || idsts_after_bmod.fbe() || idsts_after_bmod.ais() {
+            warn!(
+                "try_enable_idmac: abnormal IDSTS after BMOD enable: {:?}",
+                idsts_after_bmod
+            );
+        }
+        if !bmod_after.de() || bmod_after.dsl() != 0 || !bmod_after.fb() {
+            warn!(
+                "Failed to set BMOD register for IDMAC, use PIO mode instead; actual: de={}, dsl={}, fb={}, pbl={}",
+                bmod_after.de(),
+                bmod_after.dsl(),
+                bmod_after.fb(),
+                bmod_after.pbl(),
+            );
+            unsafe {
+                crate::dma::dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
+            }
+            self.dma_buffer = None;
+            return;
+        }
+
+        // Set the CTRL register to enable the use of the internal DMA controller (IDMAC)
+        // and enable the SD/MMC controller interrupt output.
+        self.regs
+            .ctrl()
+            .update(|r| r.with_use_internal_dmac(true).with_int_enable(true));
+        // Immediately reading back CTRL register after writing is necessary to ensure that the write has taken effect before proceeding.
+        let ctrl_after = self.regs.ctrl().read();
+        let idsts_after_ctrl = self.regs.idsts().read();
+        if !ctrl_after.use_internal_dmac() || !ctrl_after.int_enable() {
+            warn!(
+                "Failed to set CTRL register for IDMAC and interrupt output, use PIO mode instead; expected use_internal_dmac=true, int_enable=true. actual: use_internal_dmac={}, int_enable={}. IDSTS={:?}",
+                ctrl_after.use_internal_dmac(),
+                ctrl_after.int_enable(),
+                idsts_after_ctrl
+            );
+            unsafe {
+                crate::dma::dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
+            }
+            self.dma_buffer = None;
+            return;
+        }
+        if idsts_after_ctrl.du() || idsts_after_ctrl.fbe() || idsts_after_ctrl.ais() {
+            warn!(
+                "try_enable_idmac: abnormal IDSTS after CTRL enable; disabling IDMAC path: {:?}",
+                idsts_after_ctrl
+            );
+            unsafe {
+                crate::dma::dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
+            }
+            self.dma_buffer = None;
+            return;
+        }
+
+        // Step 4: Enable IDMAC interrupts inside the SD/MMC controller.
+        // Without these, the controller will not raise an external IRQ for DMA completion.
+        self.regs.idinten().write(
+            crate::regs::IdIntEn::new()
+                .with_ai(true)
+                .with_ni(true)
+                .with_ces(true)
+                .with_du(true)
+                .with_fbe(true)
+                .with_ri(true)
+                .with_ti(true),
+        );
+        self.regs
+            .intmask()
+            .write(crate::regs::IntMask::new().with_dto(true));
+
+        // Immediately read back the interrupt settings for verification.
+        let idinten_after = self.regs.idinten().read();
+        let intmask_after = self.regs.intmask().read();
+        let idsts_after_enable = self.regs.idsts().read();
+        if !idinten_after.ai()
+            || !idinten_after.ni()
+            || !idinten_after.ces()
+            || !idinten_after.du()
+            || !idinten_after.fbe()
+            || !idinten_after.ri()
+            || !idinten_after.ti()
+        {
+            warn!(
+                "try_enable_idmac: IDINTEN mismatch after write; verify hardware support and register access"
+            );
+        }
+        if !intmask_after.dto()
+            || intmask_after.cmd()
+            || intmask_after.rxdr()
+            || intmask_after.txdr()
+        {
+            warn!(
+                "try_enable_idmac: INTMASK mismatch after write; dto={}, cmd={}, rxdr={}, txdr={}",
+                intmask_after.dto(),
+                intmask_after.cmd(),
+                intmask_after.rxdr(),
+                intmask_after.txdr(),
+            );
+        }
+        if idsts_after_enable.du() || idsts_after_enable.fbe() || idsts_after_enable.ais() {
+            warn!(
+                "try_enable_idmac: abnormal post-enable IDSTS detected: {:?}",
+                idsts_after_enable
+            );
+        }
+
+        // Step 5: Enable a kernel IRQ handler for the SD/MMC device.
+        let irq_registered = register_irq();
+        if !irq_registered {
+            let idsts_on_irq_fail = self.regs.idsts().read();
+            let idinten_on_irq_fail = self.regs.idinten().read();
+            let rintsts_on_irq_fail = self.regs.rintsts().read();
+            warn!(
+                "Failed to register IRQ for IDMAC, use PIO mode instead; RINTSTS={:?}, IDSTS={:?}, IDINTEN={:?}, DBADDR=0x{:08x}",
+                rintsts_on_irq_fail,
+                idsts_on_irq_fail,
+                idinten_on_irq_fail,
+                self.regs.dbaddr().read(),
+            );
+            unsafe {
+                crate::dma::dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
+            }
+            self.dma_buffer = None;
+
+            // Reset registers to disable IDMAC and return to a clean state
+            self.regs.bmod().update(|r| r.with_de(false).with_swr(true));
+            self.regs
+                .ctrl()
+                .update(|r| r.with_dma_reset(true).with_use_internal_dmac(false));
+            return;
+        }
+
+        info!("IDMAC enabled for DMA transfer");
     }
 
     ///实现dma传输
@@ -944,10 +998,10 @@ impl SdMmc {
     ///
     /// 本函数不接受 `self` 参数，通过全局的寄存器基地址 `SDMMC_BASE_ADDR` 访问硬件寄存器，
     /// 从而可以直接挂载到系统的中断向量表中。
-    pub fn handle_interrupt() {
+    pub fn dma_irq_handler() {
         let previous_flag = IDMAC_DONE_FLAG.load(Ordering::Acquire);
         debug!(
-            "SdMmc::handle_interrupt entered; previous IDMAC_DONE_FLAG={}",
+            "SdMmc::dma_irq_handler entered; previous IDMAC_DONE_FLAG={}",
             previous_flag
         );
         let base = SDMMC_BASE_ADDR.load(Ordering::Acquire);

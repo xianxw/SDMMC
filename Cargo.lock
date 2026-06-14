@@ -100,9 +100,9 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "axalloc"
-version = "0.3.0-preview.3"
+version = "0.3.0-preview.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5bb0695cfda0a651f3b44026899987c51c76063a9a807666f8f6b5e93a67966"
+checksum = "1a10c400cbdf0f611f92fcdd6e2c658de329085d3156ba65e323da7eaa7c7aca"
 dependencies = [
  "axallocator",
  "axerrno 0.2.2",
@@ -127,9 +127,9 @@ dependencies = [
 
 [[package]]
 name = "axconfig"
-version = "0.3.0-preview.3"
+version = "0.3.0-preview.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15f74d126fc479e4a5acd4389e7ef2c9176c41e7ea3c54e985a7468489b494fb"
+checksum = "25985c64d932bf954b02eaf0873e4445d234d39b5100b1985585e3276b6b47d1"
 dependencies = [
  "axconfig-macros",
 ]
@@ -182,9 +182,9 @@ dependencies = [
 
 [[package]]
 name = "axdma"
-version = "0.3.0-preview.3"
+version = "0.3.0-preview.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7e2db5239af3180d3418dc0bf9008e6a6df7676c99948694cff3999a39c0a9f"
+checksum = "b2dcb880e69e91abdf754af737de746ecfd42c800cc3385599365c9482eb1fb3"
 dependencies = [
  "axalloc",
  "axallocator",
@@ -218,9 +218,9 @@ dependencies = [
 
 [[package]]
 name = "axhal"
-version = "0.3.0-preview.3"
+version = "0.3.0-preview.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "281f69e09ddb6eb04b7695fc8bdf5a58c760c630443aca8e69abc65ded5642da"
+checksum = "2b721414abb9554522acdc0495cef83eadfc7d47257fe3c979e655c982d79588"
 dependencies = [
  "axalloc",
  "axconfig",
@@ -239,9 +239,9 @@ dependencies = [
 
 [[package]]
 name = "axmm"
-version = "0.3.0-preview.3"
+version = "0.3.0-preview.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36e9513a2db8f0ad60733581f0ecd77c8c7f7db7b5fcaa1784752504ad924e00"
+checksum = "49440d27560749ce68ed60e44377772f09a4beaae3f96e1b875c4794b29c8e64"
 dependencies = [
  "axalloc",
  "axerrno 0.2.2",
@@ -301,9 +301,9 @@ dependencies = [
 
 [[package]]
 name = "axtask"
-version = "0.3.0-preview.3"
+version = "0.3.0-preview.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "678fe49dac66ef02c5ed0a8657e5fbc74d40b66e29b9864f5e4325741c0ad878"
+checksum = "bc45120776afddf28b19bb7aba87e379c5779cf28a8f7884943a4821caeec774"
 dependencies = [
  "axconfig",
  "axerrno 0.2.2",
@@ -932,7 +932,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "simple-sdmmc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axdma",
  "axhal",
